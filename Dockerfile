@@ -21,4 +21,10 @@ EXPOSE 9102
 HEALTHCHECK --interval=30s --timeout=10s --start-period=3m --retries=5 CMD /app/healthCheckOrDumpStack.sh || exit 1
 CMD ["/app/ecs_service_metrics_exporter"]
 
+# On the ECS instances, 992 is the Docker group
+USER root
+RUN groupadd -g 992 docker && \
+	usermod -G docker -a app
+USER app
+
 COPY --from=builder /app/for_final_image/ /app/
