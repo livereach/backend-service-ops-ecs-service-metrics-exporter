@@ -8,8 +8,8 @@ use bollard::models::ContainerSummary;
 use futures_util::TryStreamExt;
 use log::{debug, info, warn};
 
-const DEFAULT_SERVICE_PORT_PATH: &'static str = "9100/metrics";
-const UNKNOWN_SERVICE_NAME: &'static str = "unknown-service";
+const DEFAULT_SERVICE_PORT_PATH: &str = "9100/metrics";
+const UNKNOWN_SERVICE_NAME: &str = "unknown-service";
 
 pub struct ServiceMetricsExporter {
 	docker: Docker,
@@ -50,11 +50,11 @@ impl ServiceMetricsExporter {
 		for container in containers {
 			let container_id = &container.id.clone().unwrap();
 			let aws_container_name = &container.labels.clone()
-				.unwrap_or(HashMap::new())
+				.unwrap_or_default()
 				.get("com.amazonaws.ecs.container-name")
 				.unwrap_or(&UNKNOWN_SERVICE_NAME.to_string())
 				.to_string();
-			let curl_exec = self.create_docker_exec_for_curl(container, &container_id).await;
+			let curl_exec = self.create_docker_exec_for_curl(container, container_id).await;
 
 			if let Err(err) = curl_exec {
 				warn!("Failed to create exec in container={:?}, e={:?}", &container_id, err);
@@ -98,8 +98,8 @@ impl ServiceMetricsExporter {
 			.await
 	}
 
-	async fn create_docker_exec_for_curl(&self, container: ContainerSummary, container_id: &String) -> Result<CreateExecResults, BollardError> {
-		let port_and_metric_path = container.labels.unwrap_or(HashMap::new())
+	async fn create_docker_exec_for_curl(&self, container: ContainerSummary, container_id: &str) -> Result<CreateExecResults, BollardError> {
+		let port_and_metric_path = container.labels.unwrap_or_default()
 			.get(&self.label_has_metrics)
 			.unwrap_or(&DEFAULT_SERVICE_PORT_PATH.to_string())
 			.to_string();
@@ -107,7 +107,7 @@ impl ServiceMetricsExporter {
 		let curl_url = format!("http://localhost:{}", port_and_metric_path);
 		let curl_command = vec!["/bin/curl", "-s", curl_url.as_str()];
 
-		self.docker.create_exec(&container_id, CreateExecOptions {
+		self.docker.create_exec(container_id, CreateExecOptions {
 			attach_stdout: Some(true),
 			attach_stderr: Some(false),
 			cmd: Some(curl_command),
@@ -116,8 +116,8 @@ impl ServiceMetricsExporter {
 			.await
 	}
 
-	async fn start_curl_exec_return_logs(&self, container_id: &String, exec_id: &String) -> Option<Vec<String>> {
-		match self.docker.start_exec(&exec_id, None).await {
+	async fn start_curl_exec_return_logs(&self, container_id: &String, exec_id: &str) -> Option<Vec<String>> {
+		match self.docker.start_exec(exec_id, None).await {
 			Ok(StartExecResults::Attached { output, .. }) => {
 				debug!("Started cURL in container={}", &container_id);
 				let log = output.try_collect().await;
@@ -159,22 +159,22 @@ impl ServiceMetricsExporter {
 
 	fn add_service_name_to_metric_line(&self, line: &String, container_name: &str) -> String {
 		// return comment/meta lines unaltered
-		if line.trim().starts_with("#") {
+		if line.trim().starts_with('#') {
 			return line.to_string();
 		}
 
 		let service_label = format!("container_name={}", container_name);
 
 		// already has a label => add our label as the first one, including a trailing comma
-		if let Some(bracket_position) = line.find("{") {
+		if let Some(bracket_position) = line.find('{') {
 			let (line_left, line_right) = line.split_at(bracket_position + 1);
-			return format!("{}{},{}", line_left, service_label, line_right).to_string();
+			return format!("{}{},{}", line_left, service_label, line_right);
 		}
 
 		// no label yet => insert the whole label thingy
-		if let Some(space_pos) = line.find(" ") {
+		if let Some(space_pos) = line.find(' ') {
 			let (line_left, line_right) = line.split_at(space_pos);
-			return format!("{}{{{}}}{}", line_left, service_label, line_right).to_string();
+			return format!("{}{{{}}}{}", line_left, service_label, line_right);
 		}
 
 		info!("Encountered a weird line, neither comment nor parsable metric, not attaching service name: {}", line);

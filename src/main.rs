@@ -13,8 +13,8 @@ use crate::service_exporter::ServiceMetricsExporter;
 
 mod service_exporter;
 
-const CONFIG_KEY_DOCKER_LABEL_HAS_METRICS: &'static str = "DOCKER_LABEL_HAS_METRICS";
-const CONFIG_KEY_HTTP_LISTEN_PORT: &'static str = "HTTP_LISTEN_PORT";
+const CONFIG_KEY_DOCKER_LABEL_HAS_METRICS: &str = "DOCKER_LABEL_HAS_METRICS";
+const CONFIG_KEY_HTTP_LISTEN_PORT: &str = "HTTP_LISTEN_PORT";
 
 #[tokio::main]
 async fn main() {
