@@ -7,6 +7,7 @@ use bollard::exec::{CreateExecOptions, CreateExecResults, StartExecResults};
 use bollard::models::ContainerSummary;
 use futures_util::stream::StreamExt;
 use log::{debug, info, warn};
+use tokio::task::JoinHandle;
 
 const DEFAULT_SERVICE_PORT_PATH: &str = "9100/metrics";
 const UNKNOWN_SERVICE_NAME: &str = "unknown-service";
@@ -14,6 +15,15 @@ const UNKNOWN_SERVICE_NAME: &str = "unknown-service";
 pub struct ServiceMetricsExporter {
 	docker: Docker,
 	label_has_metrics: String,
+}
+
+impl Clone for ServiceMetricsExporter {
+	fn clone(&self) -> ServiceMetricsExporter {
+		ServiceMetricsExporter {
+			docker: self.docker.clone(),
+			label_has_metrics: self.label_has_metrics.clone(),
+		}
+	}
 }
 
 
@@ -45,45 +55,62 @@ impl ServiceMetricsExporter {
 
 		let containers = containers.unwrap();
 		debug!("Found {} running containers matching the required label", containers.len());
-		let mut metrics = String::new();
+		let mut join_handles: HashMap<String, JoinHandle<Option<String>>> = HashMap::new();
+		let mut all_metrics = String::new();
 
-		// TODO Run in different Tokio threads and combine
 		for container in containers {
+			let _self = self.clone();
 			let container_id = &container.id.clone().unwrap();
-			let aws_container_name = &container.labels.clone()
-				.unwrap_or_default()
-				.get("com.amazonaws.ecs.container-name")
-				.unwrap_or(&UNKNOWN_SERVICE_NAME.to_string())
-				.to_string();
-			let curl_exec = self.create_docker_exec_for_curl(container, container_id).await;
 
-			if let Err(err) = curl_exec {
-				warn!("[Container {}]: Failed to create exec, e={:?}", &container_id, err);
-				continue;
-			}
+			let join_handle = tokio::spawn(async move {
+				let container_id = &container.id.clone().unwrap();
+				let aws_container_name = &container.labels.clone()
+					.unwrap_or_default()
+					.get("com.amazonaws.ecs.container-name")
+					.unwrap_or(&UNKNOWN_SERVICE_NAME.to_string())
+					.to_string();
+				let curl_exec = _self.create_docker_exec_for_curl(container, container_id).await;
 
-			let exec_id = curl_exec.unwrap().id;
-			let curl_output = self.start_curl_exec_return_logs(container_id, &exec_id).await;
-			let exit_code: i64 = match self.docker.inspect_exec(&exec_id).await {
-				Ok(res) => res.exit_code.unwrap_or(-1),
-				Err(err) => {
-					warn!("[Container {}]: Failed to get exit code for exec_id={}, e={:?}", &container_id, &exec_id, err);
-					-1
+				if let Err(err) = curl_exec {
+					warn!("[Container {}]: Failed to create exec, e={:?}", &container_id, err);
+					return None;
 				}
-			};
 
-			if exit_code != 0 || curl_output.is_none() {
-				warn!("[Container {}]: Exit code for exec={} is {}, output={:?}", &container_id, &exec_id, exit_code, curl_output);
-				continue;
-			}
+				let exec_id = curl_exec.unwrap().id;
+				let curl_output = _self.start_curl_exec_return_logs(container_id, &exec_id).await;
+				let exit_code: i64 = match _self.docker.inspect_exec(&exec_id).await {
+					Ok(res) => res.exit_code.unwrap_or(-1),
+					Err(err) => {
+						warn!("[Container {}]: Failed to get exit code for exec_id={}, e={:?}", &container_id, &exec_id, err);
+						-1
+					}
+				};
 
-			metrics += curl_output.unwrap().iter()
-				.map(|line| self.add_service_name_to_metric_line(container_id, aws_container_name, line))
-				.collect::<Vec<String>>()
-				.join("\n").as_str();
+				if exit_code != 0 || curl_output.is_none() {
+					warn!("[Container {}]: Exit code for exec={} is {}, output={:?}", &container_id, &exec_id, exit_code, curl_output);
+					return None;
+				}
+
+				let result = curl_output.unwrap().iter()
+					.map(|line| _self.add_service_name_to_metric_line(container_id, aws_container_name, line))
+					.collect::<Vec<String>>()
+					.join("\n").as_str()
+					.to_string();
+				Some(result)
+			});
+
+			join_handles.insert(container_id.to_string(), join_handle);
 		}
 
-		Some(metrics)
+		for join_handle in join_handles {
+			match join_handle.1.await {
+				Ok(Some(container_metrics)) => all_metrics.push_str(container_metrics.as_str()),
+				Ok(None) => debug!("[Container {}]: Returned no metrics", join_handle.0),
+				_ => warn!("[Container {}]: Failed to collect metrics from container", join_handle.0),
+			};
+		}
+
+		Some(all_metrics)
 	}
 
 	async fn get_docker_containers_matching_label(&self) -> Result<Vec<ContainerSummary>, BollardError> {
