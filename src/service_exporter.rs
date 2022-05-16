@@ -185,7 +185,7 @@ impl ServiceMetricsExporter {
 			return line.to_string();
 		}
 
-		let service_label = format!("container_name={}", container_name);
+		let service_label = format!("container_name=\"{}\"", container_name);
 
 		// already has a label => add our label as the first one, including a trailing comma
 		if let Some(bracket_position) = line.find('{') {
