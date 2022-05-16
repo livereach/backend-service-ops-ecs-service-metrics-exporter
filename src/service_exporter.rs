@@ -5,7 +5,7 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, CreateExecResults, StartExecResults};
 use bollard::models::ContainerSummary;
-use futures_util::TryStreamExt;
+use futures_util::stream::StreamExt;
 use log::{debug, info, warn};
 
 const DEFAULT_SERVICE_PORT_PATH: &str = "9100/metrics";
@@ -47,6 +47,7 @@ impl ServiceMetricsExporter {
 		debug!("Found {} running containers matching the required label", containers.len());
 		let mut metrics = String::new();
 
+		// TODO Run in different Tokio threads and combine
 		for container in containers {
 			let container_id = &container.id.clone().unwrap();
 			let aws_container_name = &container.labels.clone()
@@ -57,7 +58,7 @@ impl ServiceMetricsExporter {
 			let curl_exec = self.create_docker_exec_for_curl(container, container_id).await;
 
 			if let Err(err) = curl_exec {
-				warn!("Failed to create exec in container={:?}, e={:?}", &container_id, err);
+				warn!("[Container {}]: Failed to create exec, e={:?}", &container_id, err);
 				continue;
 			}
 
@@ -66,18 +67,18 @@ impl ServiceMetricsExporter {
 			let exit_code: i64 = match self.docker.inspect_exec(&exec_id).await {
 				Ok(res) => res.exit_code.unwrap_or(-1),
 				Err(err) => {
-					warn!("Failed to get exit code for exec_id={}, e={:?}", &exec_id, err);
+					warn!("[Container {}]: Failed to get exit code for exec_id={}, e={:?}", &container_id, &exec_id, err);
 					-1
 				}
 			};
 
 			if exit_code != 0 || curl_output.is_none() {
-				warn!("Exit code for exec={} in container={} is {}, output={:?}", &exec_id, &container_id, exit_code, curl_output);
+				warn!("[Container {}]: Exit code for exec={} is {}, output={:?}", &container_id, &exec_id, exit_code, curl_output);
 				continue;
 			}
 
 			metrics += curl_output.unwrap().iter()
-				.map(|line| self.add_service_name_to_metric_line(line, aws_container_name))
+				.map(|line| self.add_service_name_to_metric_line(container_id, aws_container_name, line))
 				.collect::<Vec<String>>()
 				.join("\n").as_str();
 		}
@@ -117,49 +118,43 @@ impl ServiceMetricsExporter {
 	}
 
 	async fn start_curl_exec_return_logs(&self, container_id: &String, exec_id: &str) -> Option<Vec<String>> {
-		match self.docker.start_exec(exec_id, None).await {
-			Ok(StartExecResults::Attached { output, .. }) => {
-				debug!("Started cURL in container={}", &container_id);
-				let log = output.try_collect().await;
-				if let Err(err) = log {
-					debug!("Failed to get output for container={}, e={:?}", &container_id, err);
-					return None;
-				}
-
-				let log: Vec<_> = log.unwrap();
-
-				if log.is_empty() {
-					warn!("Found no output log for container={}", &container_id);
-					return None;
-				}
-
-				let mut output_lines = vec![];
-				match &log[0] {
-					LogOutput::StdOut { message } => {
-						for line in String::from_utf8_lossy(message).split('\n') {
-							output_lines.push(line.to_string());
-						}
-					}
-					LogOutput::StdErr { .. } => {}
-					LogOutput::StdIn { .. } => {}
-					LogOutput::Console { .. } => {}
-				};
-				Some(output_lines)
-			}
+		let mut output = match self.docker.start_exec(exec_id, None).await {
+			Ok(StartExecResults::Attached { output, .. }) => output,
 			Ok(StartExecResults::Detached) => {
-				warn!("Somehow failed to start cURL in container={} => detached", &container_id);
-				None
+				warn!("[Container {}]: Somehow got unexpected detached cURL", container_id);
+				return None;
 			}
 			Err(err) => {
-				warn!("Failed to start cURL exec in container={}, e={:?}", &container_id, err);
-				None
+				warn!("[Container {}]: Failed to start cURL exec, e={:?}", container_id, err);
+				return None;
 			}
+		};
+
+		debug!("[Container {}]: Got result from cURL", container_id);
+		let mut result: Vec<u8> = vec![];
+
+		while let Some(out_data) = output.next().await {
+			match out_data {
+				Ok(LogOutput::StdOut { message }) => {
+					result.append(&mut message.to_vec());
+				}
+				Ok(LogOutput::StdErr { message }) => info!("[Container {}]: Got stderr={:?}", container_id, String::from_utf8_lossy(&message.to_vec())),
+				Err(err) => { debug!("Got ERR line={:?}", err) }
+				_ => {}
+			};
 		}
+
+		Some(String::from_utf8_lossy(&result).split('\n').map(|s| s.to_string()).collect())
 	}
 
-	fn add_service_name_to_metric_line(&self, line: &String, container_name: &str) -> String {
+	fn add_service_name_to_metric_line(&self, container_id: &String, container_name: &str, line: &String) -> String {
 		// return comment/meta lines unaltered
 		if line.trim().starts_with('#') {
+			return line.to_string();
+		}
+
+		// ignore any empty lines
+		if line.is_empty() {
 			return line.to_string();
 		}
 
@@ -177,8 +172,7 @@ impl ServiceMetricsExporter {
 			return format!("{}{{{}}}{}", line_left, service_label, line_right);
 		}
 
-		info!("Encountered a weird line, neither comment nor parsable metric, not attaching service name: {}", line);
+		info!("[Container {}]: Encountered a weird line, neither comment nor parsable metric, not attaching service name: {}", container_id, line);
 		line.to_string()
 	}
-
 }
